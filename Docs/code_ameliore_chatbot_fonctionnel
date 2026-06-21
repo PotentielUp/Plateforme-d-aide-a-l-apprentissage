@@ -1,0 +1,249 @@
+import os
+import json
+import gradio as gr
+from datetime import datetime
+from fpdf import FPDF
+
+try:
+    import PyPDF2
+except ImportError:
+    print("Veuillez installer PyPDF2 : pip install PyPDF2 gradio fpdf2")
+    exit()
+
+import ollama
+
+# ---------------------------------------------------------
+# GESTION DE L'HISTORIQUE (JSON)
+# ---------------------------------------------------------
+HISTORY_FILE = "assistant_history.json"
+
+def save_to_history(category, content):
+    history = []
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            history = json.load(f)
+    entry = {"id": len(history) + 1, "date": datetime.now().strftime("%d/%m/%Y %H:%M"), "category": category, "content": content}
+    history.append(entry)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=4)
+    return history
+
+def get_history_labels():
+    if not os.path.exists(HISTORY_FILE): return []
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        history = json.load(f)
+    return [f"{i['date']} - {i['category']} (ID:{i['id']})" for i in history]
+
+# ---------------------------------------------------------
+# GÉNÉRATION DE PDF
+# ---------------------------------------------------------
+def generate_pdf(text, filename="resultat.pdf"):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    clean_text = text.encode('latin-1', 'replace').decode('latin-1')
+    pdf.multi_cell(0, 10, txt=clean_text, align='L')
+    path = f"downloads_{filename}"
+    pdf.output(path)
+    return path
+
+# ---------------------------------------------------------
+# LOGIQUE IA ET TRAITEMENT
+# ---------------------------------------------------------
+def appeler_gemma(prompt_systeme: str, messages_conversation: list) -> str:
+    """
+    Appelle Gemma avec un prompt système et un historique de messages.
+    """
+    # On construit la liste des messages pour Ollama
+    full_messages = [{"role": "system", "content": prompt_systeme}]
+    full_messages.extend(messages_conversation)
+
+    reponse = ollama.chat(
+        model="gemma4:31b-cloud",
+        messages=full_messages,
+        options={"temperature": 0.7}
+    )
+    return reponse["message"]["content"]
+
+def extraire_texte(fichiers) -> str:
+    if not fichiers: return ""
+    texte_complet = ""
+    for fichier in fichiers:
+        chemin = fichier if isinstance(fichier, str) else fichier.name 
+        ext = os.path.splitext(chemin)[1].lower()
+        if ext == ".pdf":
+            try:
+                with open(chemin, "rb") as f:
+                    lecteur = PyPDF2.PdfReader(f)
+                    for page in lecteur.pages:
+                        texte = page.extract_text()
+                        if texte: texte_complet += texte + "\n"
+            except Exception as e: texte_complet += f"\n[Erreur PDF : {str(e)}]\n"
+        elif ext == ".txt":
+            try:
+                with open(chemin, "r", encoding="utf-8") as f:
+                    texte_complet += f.read() + "\n"
+            except Exception as e: texte_complet += f"\n[Erreur TXT : {str(e)}]\n"
+    return texte_complet
+
+# --- CALLBACKS GÉNÉRATION ---
+def traiter_apprentissage(fichiers_cours):
+    texte = extraire_texte(fichiers_cours)
+    if not texte.strip(): return "⚠️ Veuillez uploader vos cours.", None
+    prompt = "Tu es un tuteur pédagogique. Restructure la leçon, explique les notions clairement et propose un plan d'apprentissage."
+    res = appeler_gemma(prompt, [{"role": "user", "content": texte}])
+    save_to_history("Apprentissage", res)
+    return res
+
+def traiter_fiches(fichiers_cours):
+    texte = extraire_texte(fichiers_cours)
+    if not texte.strip(): return "⚠️ Veuillez uploader vos cours.", None
+    prompt = "Tu es un expert. Génère une fiche de révision ultra-synthétique à partir du cours."
+    res = appeler_gemma(prompt, [{"role": "user", "content": texte}])
+    save_to_history("Fiche de Révision", res)
+    return res
+
+def traiter_evaluations(fichiers_cours, fichiers_evals):
+    texte_cours = extraire_texte(fichiers_cours)
+    texte_evals = extraire_texte(fichiers_evals)
+    if not texte_cours.strip() or not texte_evals.strip():
+        return "⚠️ Cours et anciens sujets requis.", None
+    texte_combine = f"--- COURS ---\n{texte_cours}\n\n--- ANCIENS SUJETS ---\n{texte_evals}"
+    prompt = "Analyse le cours et les sujets. Cible les éléments récurrents et prépare l'étudiant."
+    res = appeler_gemma(prompt, [{"role": "user", "content": texte_combine}])
+    save_to_history("Évaluation", res)
+    return res
+
+# --- LOGIQUE DU CHATBOT ---
+def chat_response(message, history, fichiers_cours):
+    """
+    Fonction gérant le flux du chatbot avec nettoyage du format Gradio -> Ollama.
+    """
+    # 1. Extraire le contexte des documents
+    contexte_docs = extraire_texte(fichiers_cours)
+    
+    if not contexte_docs.strip():
+        # Format pour Gradio (liste de dicts)
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": "⚠️ Veuillez d'abord uploader vos documents de cours."})
+        return history
+
+    # 2. Préparer le Prompt Système
+    prompt_systeme = (
+        "Tu es un assistant pédagogique expert. Ton rôle est de répondre aux questions de l'utilisateur "
+        "en te basant EXCLUSIVEMENT sur les documents fournis ci-dessous.\n\n"
+        f"--- DOCUMENTS DE RÉFÉRENCE ---\n{contexte_docs}\n--- FIN DES DOCUMENTS ---"
+    )
+
+    # 3. NETTOYAGE DU FORMAT : On convertit les listes de blocs Gradio en simples chaînes pour Ollama
+    messages_ollama = []
+    for msg in history:
+        role = msg.get("role")
+        content = msg.get("content")
+        
+        # Si le contenu est une liste (format multi-modal de Gradio), on extrait le texte
+        if isinstance(content, list):
+            # On récupère le texte de chaque bloc et on les joint
+            text_content = " ".join([block["text"] for block in content if block.get("type") == "text"])
+        else:
+            text_content = content
+            
+        messages_ollama.append({"role": role, "content": text_content})
+    
+    # Ajouter la question actuelle (le 'message' est une string, donc pas besoin de nettoyage)
+    messages_ollama.append({"role": "user", "content": message})
+
+    # 4. Appeler l'IA
+    try:
+        reponse_ia = appeler_gemma(prompt_systeme, messages_ollama)
+    except Exception as e:
+        reponse_ia = f"Erreur lors de l'appel au modèle : {str(e)}"
+    
+    # 5. Mettre à jour l'historique pour Gradio
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": reponse_ia})
+    
+    return history
+
+
+
+def download_as_pdf(text, label):
+    if not text or "⚠️" in text: return None
+    filename = f"{label}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+    return generate_pdf(text, filename)
+
+def charger_historique(label):
+    if not label: return ""
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        history = json.load(f)
+    for item in history:
+        if f"(ID:{item['id']})" in label: return item['content']
+    return "Aucun résultat trouvé."
+
+# ---------------------------------------------------------
+# INTERFACE GRADIO
+# ---------------------------------------------------------
+with gr.Blocks(theme=gr.themes.Soft(), title="Gemma4:31b Éducation") as interface:
+    gr.Markdown("# 🎓 Longoka mbote : Assistant Pédagogique")
+    
+    upload_cours_global = gr.File(label="Supports de cours", file_count="multiple", file_types=[".pdf", ".txt"])
+    
+    with gr.Tabs():
+        # --- ONGLET ÉTUDE ---
+        with gr.Tab("📚 Étude du cours"):
+            with gr.Row():
+                with gr.Column():
+                    with gr.Tab("📖 Apprentissage"):
+                        btn_app = gr.Button("Restructurer le cours", variant="primary")
+                        res_app = gr.Markdown()
+                        btn_pdf_app = gr.Button("📥 Télécharger PDF")
+                        file_pdf_app = gr.File(label="Fichier PDF")
+                        btn_app.click(fn=traiter_apprentissage, inputs=upload_cours_global, outputs=res_app)
+                        btn_pdf_app.click(fn=download_as_pdf, inputs=[res_app, gr.State("Apprentissage")], outputs=file_pdf_app)
+
+                    with gr.Tab("📝 Fiches"):
+                        btn_fiches = gr.Button("Générer la Fiche", variant="primary")
+                        res_fiches = gr.Markdown()
+                        btn_pdf_fiches = gr.Button("📥 Télécharger PDF")
+                        file_pdf_fiches = gr.File(label="Fichier PDF")
+                        btn_fiches.click(fn=traiter_fiches, inputs=upload_cours_global, outputs=res_fiches)
+                        btn_pdf_fiches.click(fn=download_as_pdf, inputs=[res_fiches, gr.State("Fiche")], outputs=file_pdf_fiches)
+
+        # --- ONGLET ÉVALUATION ---
+        with gr.Tab("🎯 Évaluations"):
+            with gr.Row():
+                with gr.Column():
+                    upload_evals = gr.File(label="Sujets d'examens", file_count="multiple", file_types=[".pdf", ".txt"])
+                    btn_eval = gr.Button("Préparer l'étudiant", variant="primary")
+                with gr.Column():
+                    res_eval = gr.Markdown()
+                    btn_pdf_eval = gr.Button("📥 Télécharger PDF")
+                    file_pdf_eval = gr.File(label="Fichier PDF")
+                    btn_eval.click(fn=traiter_evaluations, inputs=[upload_cours_global, upload_evals], outputs=res_eval)
+                    btn_pdf_eval.click(fn=download_as_pdf, inputs=[res_eval, gr.State("Evaluation")], outputs=file_pdf_eval)
+
+        # --- NOUVEL ONGLET CHATBOT ---
+        with gr.Tab("💬 Chat Interactif"):
+            gr.Markdown("### Posez des questions sur vos cours")
+            chatbot = gr.Chatbot(label="Assistant Pédagogique", height=500)
+            msg = gr.Textbox(label="Votre question", placeholder="Ex: Peux-tu m'expliquer le concept de page 4 ?")
+            clear = gr.Button("Effacer la conversation")
+
+            # Action quand on appuie sur Entrée dans le Textbox
+            msg.submit(fn=chat_response, inputs=[msg, chatbot, upload_cours_global], outputs=[chatbot])
+            
+            # On vide le champ de texte après l'envoi et on met à jour le bot
+            msg.submit(fn=lambda: "", outputs=[msg])
+            clear.click(fn=lambda: [], outputs=[chatbot])
+
+        # --- ONGLET HISTORIQUE ---
+        with gr.Tab("⏳ Historique"):
+            gr.Markdown("### Retrouvez vos anciennes analyses")
+            drop_hist = gr.Dropdown(label="Sélectionnez une session", choices=get_history_labels())
+            res_hist = gr.Markdown()
+            btn_refresh_hist = gr.Button("🔄 Actualiser l'historique")
+            btn_refresh_hist.click(fn=lambda: gr.update(choices=get_history_labels()), outputs=drop_hist)
+            drop_hist.change(fn=charger_historique, inputs=drop_hist, outputs=res_hist)
+
+if __name__ == "__main__":
+    interface.launch()

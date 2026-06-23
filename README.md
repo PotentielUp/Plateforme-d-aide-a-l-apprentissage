@@ -32,8 +32,8 @@ L'approche repose sur l'idée de transformer l'IA en un **architecte pédagogiqu
 
 ---
 
-## 🚀 Évolution en cours : L'Agent conversationnel (Tuteur IA)
-Le projet évolue vers une expérience interactive avec l'intégration d'un **Chatbot intelligent** :
+## 🚀 Derniere mise a jour : L'Agent conversationnel (Tuteur IA)
+Le projet a évolué vers une expérience interactive avec l'intégration d'un **Chatbot intelligent** :
 - **Interactivité :** Possibilité pour l'apprenant de poser des questions spécifiques sur un point du cours.
 - **Explications personnalisées :** L'IA adapte son niveau de langage en fonction de la demande de l'utilisateur.
 - **Personnalisation du programme :** Ajustement du plan d'apprentissage en temps réel selon les difficultés rencontrées.
